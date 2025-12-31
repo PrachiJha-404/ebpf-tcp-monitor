@@ -1,0 +1,22 @@
+# Binary executables
+tcp-drop-monitor
+__debug_bin
+
+# eBPF Generated Artifacts
+# We don't commit these because they are architecture-specific 
+# and should be generated during the build process.
+*_bpfel.go
+*_bpfeb.go
+*_bpfel.o
+*_bpfeb.o
+
+# Kernel headers
+# vmlinux.h is specific to YOUR kernel version. 
+# Others should generate their own.
+bpf/vmlinux.h
+
+# Go dependencies and OS files
+vendor/
+.env
+.DS_Store
+*.swp
