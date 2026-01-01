@@ -10,6 +10,7 @@
 struct event{
     u32 pid;
     u32 reason;
+    u64 location; //Memory address of the drop
 };
 
 struct {
@@ -27,6 +28,7 @@ int trace_tcp_drop(struct trace_event_raw_kfree_skb *ctx){
     if (!e) return 0;
     e->pid = bpf_get_current_pid_tgid() >> 32;
     e->reason = ctx->reason;
+    e->location = (u64)ctx->location;
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

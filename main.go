@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -15,7 +18,32 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
+// Global Cache
+var symbolCache = map[uint64]string{}
+
+func loadSymbols() {
+	file, err := os.Open("/proc/kallsyms")
+	if err != nil {
+		log.Printf("Warning: could not open kallsyms: %v", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			continue
+		}
+		// Address is field 0, Name is field 2
+		addr, _ := strconv.ParseUint(fields[0], 16, 64)
+		symbolCache[addr] = fields[2]
+	}
+}
+
 func main() {
+
+	loadSymbols()
 
 	var dropReasons = map[uint32]string{
 		2:  "NOT_SPECIFIED",
@@ -86,13 +114,23 @@ func main() {
 				log.Printf("sample too small: %d", len(record.RawSample))
 				continue
 			}
+			//Safety check
+			//RawSample is raw, unparsed data that eBPF sent from the kernel
+			//RHS is our struct that we are fitting it into
+			//If data recieved is too smol we skip
 
 			event = *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))
 			reasonStr := dropReasons[event.Reason]
 			if reasonStr == "" {
 				reasonStr = fmt.Sprintf("UNKNOWN(%d)", event.Reason)
 			}
-			fmt.Printf("[%s] Drop Detected | PID: %-6d | Reason: %s\n", time.Now().Format("15:04:05"), event.Pid, reasonStr)
+
+			symbolName := symbolCache[event.Location]
+			if symbolName == "" {
+				// Fallback to hex if not found
+				symbolName = fmt.Sprintf("0x%x", event.Location)
+			}
+			fmt.Printf("[%s] Drop Detected | PID: %-6d | Reason: %-18s| Function: %s\n", time.Now().Format("15:04:05"), event.Pid, reasonStr, symbolName)
 		}
 	}()
 
