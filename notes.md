@@ -56,3 +56,54 @@ type monitorObjects struct {
 - The "Big Build": When you run go build, the Go compiler sees that //go:embed directive. It reaches out, grabs the binary data inside monitor_bpfel.o, and shoves it directly into your final Go executable.
 
 ### What is a Tracepoint?
+- A Tracepoint is a static "hook" or marker manually placed by kernel developers at key locations in the Linux kernel source code (e.g., inside the network stack, scheduler, or memory management).
+
+    - Purpose: To provide a stable way to observe kernel behavior without modifying or recompiling the kernel.
+
+    - Stability: Unlike other methods, tracepoints are considered a stable API. They rarely change between kernel versions, making them perfect for production monitoring tools.
+
+### How does a Tracepoint work?
+
+- Tracepoints use a highly efficient mechanism to ensure they don't slow down the system when not in use.
+
+    - Inactive State: The tracepoint is represented in the CPU instructions as a NOP (No-Operation). The CPU simply skips over it with near-zero performance hit.
+
+    - Active State: When you "enable" the tracepoint, the kernel dynamically patches the code, replacing the NOP with a Jump instruction.
+
+    - The Loop: The Jump sends the CPU to your tracing program (the probe), executes your logic, and then jumps back to the original kernel instruction.
+
+### How to view tracepoint formats?
+
+- Every tracepoint has a directory in the debugfs file system. You can view the specific data a tracepoint provides by reading its format file.
+Command: ```bash sudo cat /sys/kernel/debug/tracing/events/skb/kfree_skb/format ```
+
+### Why is the format file used?
+
+- Defining offsets: It tells our program exactly how many bytes into the memory buffer a specific field starts
+- Structuring eBPF: When writing eBPF code, you use this file to create a C struct that matches the kernel's data layout.
+- Human Readability: It includes a print fmt line that shows how to turn the raw binary data into a readable string (e.g., converting an IP address from hex to a dot-decimal string).
+
+### WHAT memory buffer?
+
+- When a tracepoint fires, it doesn't just log the data, it takes a snapshot of raw data from the CPU's RAM and puts it into the RIng Buffer. 
+- The kernel developers hardcoded these offsets, which is what is stored inside the format files. 
+- Because the space is pre-determined, if your laptop is dropping 1 million packets per second and your eBPF program is trying to write an event for every single one, the ring buffer will eventually fill up. If the "Tail" of the buffer catches up to the "Head," the kernel will start dropping your trace data to avoid slowing down the actual network traffic.
+
+### Tracepoints and Kprobes?
+- Tracepoints: These are pre-installed "faucets" (hooks) put there by the builders. They are easy to use and won't leak, but you can only use them where they exist.
+-Kprobes: These are like taking a drill and making your own hole (hook) anywhere in the pipe. You can hook a Kprobe to almost any function name in the kernel (tcp_v4_rcv, ip_output, etc.), even if there isn't an official tracepoint there.
+
+### Why not use binary.Read()?
+
+- It uses a feature called Reflection where it looks at the monitorEvent struct and tries to match every field one by one.
+- But since we used bpf2go to generate monitorEvent struct, it contains a hidden field called HostLayout.
+- binary.Read() doesn't know how many bytes that takes, so it stops. 
+- It is safe but too dumb to handle the special memory alignment required by the Linux kernel.
+- binary.Read creates a lot of temporary objects in memory. In a high-concurrency system this triggers the "Garbage Collector," which causes "Lag Spikes."
+- So we use 'unsafe'.
+
+### How does `unsafe` work?
+
+
+### IDEAS
+- Instead of collecting each snapshot for each dropped packet in the buffer, I can group them together into a hash map grouped by PID, reason, COUNT
