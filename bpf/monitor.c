@@ -15,6 +15,7 @@ struct event{
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF); //FIFO Queue, better than PerfBuffer cuz its shared across all CPUs
     __uint(max_entries, 1 << 16); //Buffer size must be a power of 2
+    __type(value, struct event);
 } events SEC(".maps"); //ELF section marker
 //Tells the kernel this is a data structure def and not to execute it
 //Allocate memory for this buffer when you load the program

@@ -1,10 +1,16 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"unsafe"
 
-	//??
-
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
@@ -26,5 +32,59 @@ func main() {
 	//Prevent Resource Leak.
 
 	//3. Attach to the tcp_drop hook (tracepoint)
+	//A link represents the conenction between a program and a hook
+	tp, err := link.Tracepoint("skb", "kfree_skb", objs.TraceTcpDrop, nil)
+	if err != nil {
+		log.Fatalf("opening tracepoint: %v", err)
+	}
+	defer tp.Close()
+	//Puts the NOP back in for the tracepoint
+
+	//4. Open the ring buffer to read data from kernel
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		log.Fatalf("opening ringbuf reader: %v", err)
+	}
+	defer rd.Close()
+	fmt.Println("Monitor Active: Watching for TCP packet drops...")
+
+	//5. Handle graceful shutdown
+	//log.Fatal() would stop the program without closing anything
+	stopper := make(chan os.Signal, 1)
+	//We create a channel to listen for signals with buffer 1
+	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+	//On recieving Exit, OS pokes the channel instead of immediately killing the program
+	//os.Interrupt = SIGINT -= Ctrl+C
+	//syscall.SIGTERM - by system tools like Docker, kill <pid> on another terminal
+
+	go func() {
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				log.Printf("error reading from ringbuf: %v", err)
+				continue
+			}
+			var event monitorEvent //struct we defined in C!
+			// if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, event); err != nil {
+			// 	log.Printf("parsing event: %v", err)
+			// 	continue
+			// }
+			if len(record.RawSample) < int(unsafe.Sizeof(monitorEvent{})) {
+				log.Printf("sample too small: %d", len(record.RawSample))
+				continue
+			}
+
+			event = *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))
+
+			fmt.Printf("Drop Detected | PID: %d | Reason: %d\n", event.Pid, event.Reason)
+		}
+	}()
+
+	<-stopper
+	//Blocking read form a channel (code doesn't move forward until this recieves smth)
+	fmt.Println("\nShutting down...")
 
 }
