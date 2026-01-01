@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf/link"
@@ -15,6 +16,15 @@ import (
 )
 
 func main() {
+
+	var dropReasons = map[uint32]string{
+		2:  "NOT_SPECIFIED",
+		3:  "NO_SOCKET",
+		5:  "TCP_CSUM",
+		8:  "NETFILTER_DROP",
+		21: "TCP_LISTEN_OVERFLOW",
+		64: "TCP_RETRANSMIT",
+	}
 	//1. Allow the program to lock memory for eBPF resources
 	//RemoveMemlock() removes restrictions on how much memory current process can lock into RAM
 	//Why eBPF programs need this?
@@ -78,8 +88,11 @@ func main() {
 			}
 
 			event = *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))
-
-			fmt.Printf("Drop Detected | PID: %d | Reason: %d\n", event.Pid, event.Reason)
+			reasonStr := dropReasons[event.Reason]
+			if reasonStr == "" {
+				reasonStr = fmt.Sprintf("UNKNOWN(%d)", event.Reason)
+			}
+			fmt.Printf("[%s] Drop Detected | PID: %-6d | Reason: %s\n", time.Now().Format("15:04:05"), event.Pid, reasonStr)
 		}
 	}()
 
