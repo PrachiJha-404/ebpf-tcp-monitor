@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -19,7 +20,14 @@ import (
 )
 
 // Global Cache
-var symbolCache = map[uint64]string{}
+// var symbolCache = map[uint64]string{}
+// Fix: Function name
+type Symbol struct {
+	Addr uint64
+	Name string
+}
+
+var symbolList []Symbol // A sorted slice instead of a map
 
 func loadSymbols() {
 	file, err := os.Open("/proc/kallsyms")
@@ -37,8 +45,33 @@ func loadSymbols() {
 		}
 		// Address is field 0, Name is field 2
 		addr, _ := strconv.ParseUint(fields[0], 16, 64)
-		symbolCache[addr] = fields[2]
+		// symbolCache[addr] = fields[2]
+		symbolList = append(symbolList, Symbol{Addr: addr, Name: fields[2]})
 	}
+
+	// Sort by address so we can use binary search
+	sort.Slice(symbolList, func(i, j int) bool {
+		return symbolList[i].Addr < symbolList[j].Addr
+	})
+}
+
+func findNearestSymbol(addr uint64) string {
+	// Find the first element greater than addr
+	idx := sort.Search(len(symbolList), func(i int) bool {
+		return symbolList[i].Addr > addr
+	})
+
+	// The nearest symbol is the one right before that
+	if idx > 0 {
+		match := symbolList[idx-1]
+		offset := addr - match.Addr
+		// Only return if it's reasonably close (e.g., within 0x10000 bytes)
+		// This prevents matching totally unrelated symbols
+		if offset < 0x10000 {
+			return fmt.Sprintf("%s+0x%x", match.Name, offset)
+		}
+	}
+	return fmt.Sprintf("0x%x", addr)
 }
 
 func main() {
@@ -125,7 +158,8 @@ func main() {
 				reasonStr = fmt.Sprintf("UNKNOWN(%d)", event.Reason)
 			}
 
-			symbolName := symbolCache[event.Location]
+			// symbolName := symbolCache[event.Location]
+			symbolName := findNearestSymbol(event.Location)
 			if symbolName == "" {
 				// Fallback to hex if not found
 				symbolName = fmt.Sprintf("0x%x", event.Location)

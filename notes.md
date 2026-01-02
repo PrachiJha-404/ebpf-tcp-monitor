@@ -104,6 +104,13 @@ Command: ```bash sudo cat /sys/kernel/debug/tracing/events/skb/kfree_skb/format 
 
 ### How does `unsafe` work?
 
+- Instead of "parsing" the data, we "reinterpret" the memory. We tell the CPU that a specific block of bytes is already our struct.
+- ```event := *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))```
+- `&record.RawSample[0]` - Address of the first byte in the buffer
+- `unsafe.Pointer(...)` - Type erasure. Converts the Go pointer into a "Universal Pointer" that bypasses type-safety checks.
+- `(*monitorEvent)(...)` - Type reinterpretation. Tells the compiler: "Treat this address as the start of a monitorEvent struct.
+- `*` - Derefernce. Copies data from the memory address to a Go variable.
 
 ### IDEAS
 - Instead of collecting each snapshot for each dropped packet in the buffer, I can group them together into a hash map grouped by PID, reason, COUNT
+- Initially, the functions couldn't be identified.
