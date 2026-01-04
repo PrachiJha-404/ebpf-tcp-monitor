@@ -1,171 +1,125 @@
 package main
 
 import (
-	"bufio" //Buffered I/O for reading files
-	"context"
+	"bufio"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"os/signal" //Handle OS signals like Ctrl+C
+	"os/signal"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic" //Atomic operations for thread safe counters
+	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe" //Unsafe pointer operations
+	"unsafe"
 
-	"github.com/cilium/ebpf/link" //eBPF program attachment
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit" //Resource limit manipulation
+	"github.com/cilium/ebpf/rlimit"
 )
 
-//Benchmark infrastructure
+// ============================================================================
+// METRICS
+// ============================================================================
 
-type BenchmarkMetrics struct {
-	StartTime       time.Time
-	EventsRead      atomic.Uint64
-	EventsDropped   atomic.Uint64
-	RingbufErrors   atomic.Uint64
-	BytesProcessed  atomic.Uint64
-	ContextSwitches atomic.Uint64
-
-	// Latency Tracking
-	LatenciesMicros []uint64
-	//Each entry is the time (in microseconds) it took for an event to travel from the Kernel to our Go app.
-	latencyIndex atomic.Uint32
-	// Circular pointer
+type Metrics struct {
+	StartTime     time.Time
+	EventsRead    atomic.Uint64
+	EventsPrinted atomic.Uint64
+	EventsDropped atomic.Uint64
 }
 
-func NewBenchmarkMetrics() *BenchmarkMetrics {
-	return &BenchmarkMetrics{
-		StartTime:       time.Now(),
-		LatenciesMicros: make([]uint64, 10000),
-	}
+func NewMetrics() *Metrics {
+	return &Metrics{StartTime: time.Now()}
 }
 
-func (b *BenchmarkMetrics) RecordEvent(byteSize int) {
-	b.EventsRead.Add(1)
-	b.BytesProcessed.Add(uint64(byteSize))
-	// 'byteSize' is len(record.RawSample)
-}
-
-func (b *BenchmarkMetrics) RecordLatency(micros uint64) {
-	idx := b.latencyIndex.Add(1) % 10000
-	if int(idx) < len(b.LatenciesMicros) {
-		b.LatenciesMicros[idx] = micros
-	}
-}
-
-func (b *BenchmarkMetrics) GetPercentile(p float64) uint64 {
-	samples := make([]uint64, len(b.LatenciesMicros))
-	//Copy to avoid race
-	copy(samples, b.LatenciesMicros)
-
-	valid := samples[:0]
-	for _, v := range samples {
-		if v > 0 {
-			valid = append(valid, v)
-		}
-	}
-	if len(valid) == 0 {
-		return 0
-	}
-	sort.Slice(valid, func(i, j int) bool { return valid[i] < valid[j] })
-	idx := int(float64(len(valid)) * p)
-	if idx >= len(valid) {
-		idx = len(valid) - 1
-	}
-	return valid[idx]
-}
-
-func (b *BenchmarkMetrics) Report() {
-	elapsed := time.Since(b.StartTime).Seconds()
-	eventsRead := b.EventsRead.Load()
-	eventsDropped := b.EventsDropped.Load()
-	errors := b.RingbufErrors.Load()
-	bytes := b.BytesProcessed.Load()
-
-	throughput := float64(eventsRead) / elapsed
-	mbps := float64(bytes) / elapsed / 1024 / 1024 //Mega Bytes per sec
-	dropRate := 0.0
-	if eventsRead+eventsDropped > 0 {
-		dropRate = float64(eventsDropped) / float64(eventsRead+eventsDropped) * 100
-	}
-
-	p50 := b.GetPercentile(0.50)
-	p95 := b.GetPercentile(0.95)
-	p99 := b.GetPercentile(0.99)
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	fmt.Println("\n╔══════════════════════════════════════════════════════════════════════╗")
-	fmt.Println("║                      BENCHMARK REPORT                                ║")
-	fmt.Println("╠══════════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║ Duration:              %-10.2f seconds                            ║\n", elapsed)
-	fmt.Printf("║ Events Processed:      %-10d events                             ║\n", eventsRead)
-	fmt.Printf("║ Events Dropped:        %-10d (%.2f%%)                            ║\n", eventsDropped, dropRate)
-	fmt.Printf("║ Ring Buffer Errors:    %-10d                                     ║\n", errors)
-	fmt.Println("╠══════════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║ Throughput:            %-10.0f events/sec                        ║\n", throughput)
-	fmt.Printf("║ Bandwidth:             %-10.2f MB/sec                            ║\n", mbps)
-	fmt.Println("╠══════════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║ Latency P50:           %-10d µs                                  ║\n", p50)
-	fmt.Printf("║ Latency P95:           %-10d µs                                  ║\n", p95)
-	fmt.Printf("║ Latency P99:           %-10d µs                                  ║\n", p99)
-	fmt.Println("╠══════════════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║ Memory Allocated:      %-10.2f MB                               ║\n", float64(m.Alloc)/1024/1024)
-	fmt.Printf("║ Total Allocated:       %-10.2f MB                               ║\n", float64(m.TotalAlloc)/1024/1024)
-	fmt.Printf("║ Num GC Runs:           %-10d                                     ║\n", m.NumGC)
-	fmt.Println("╚══════════════════════════════════════════════════════════════════════╝")
-
-}
-
-func (b *BenchmarkMetrics) StreamingReport() {
-	lastEvents := uint64(0)
-	lastTime := time.Now()
-
+func (m *Metrics) StreamingReport(printMode bool) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	//Loop runs every second
+	lastCount := uint64(0)
+	lastTime := time.Now()
+
 	for range ticker.C {
 		now := time.Now()
-		current := b.EventsRead.Load()
-		dropped := b.EventsDropped.Load()
+		current := m.EventsRead.Load()
+		dropped := m.EventsDropped.Load()
 
 		elapsed := now.Sub(lastTime).Seconds()
-		eps := float64(current-lastEvents) / elapsed
+		eps := float64(current-lastCount) / elapsed
 
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
 
-		fmt.Printf("[%s] EPS: %8.0f | Total: %10d | Dropped: %6d | Mem: %6.1fMB | GC: %d\n",
+		// Print to stderr so it doesn't interfere with output redirection
+		fmt.Fprintf(os.Stderr, "[%s] EPS: %8.0f | Total: %10d | Dropped: %6d | Mem: %6.1fMB\n",
 			now.Format("15:04:05"),
 			eps,
 			current,
 			dropped,
-			float64(m.Alloc)/1024/1024,
-			m.NumGC)
+			float64(mem.Alloc)/1024/1024)
 
-		lastEvents = current
+		lastCount = current
 		lastTime = now
 	}
 }
 
-// Global Cache
-// var symbolCache = map[uint64]string{}
-// Fix: Function name
-// Symbol Table Structure
+func (m *Metrics) FinalReport(printMode bool) {
+	elapsed := time.Since(m.StartTime).Seconds()
+	read := m.EventsRead.Load()
+	printed := m.EventsPrinted.Load()
+	dropped := m.EventsDropped.Load()
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	// Always print to stderr so results are visible even with stdout redirect
+	out := os.Stderr
+
+	fmt.Fprintln(out, "\n╔══════════════════════════════════════════════════════════════════════╗")
+	if printMode {
+		fmt.Fprintln(out, "║                    PRINT MODE BENCHMARK REPORT                       ║")
+	} else {
+		fmt.Fprintln(out, "║                  BENCHMARK MODE REPORT (NO PRINTING)                 ║")
+	}
+	fmt.Fprintln(out, "╠══════════════════════════════════════════════════════════════════════╣")
+	fmt.Fprintf(out, "║ Duration:              %-10.2f seconds                            ║\n", elapsed)
+	fmt.Fprintf(out, "║ Events Read:           %-10d events                             ║\n", read)
+
+	if printMode {
+		fmt.Fprintf(out, "║ Events Printed:        %-10d events                             ║\n", printed)
+	}
+
+	fmt.Fprintf(out, "║ Events Dropped:        %-10d (%.2f%%)                            ║\n",
+		dropped, float64(dropped)/float64(read+dropped)*100)
+	fmt.Fprintln(out, "╠══════════════════════════════════════════════════════════════════════╣")
+	fmt.Fprintf(out, "║ Read Throughput:       %-10.0f events/sec                        ║\n", float64(read)/elapsed)
+
+	if printMode {
+		fmt.Fprintf(out, "║ Print Throughput:      %-10.0f events/sec                        ║\n", float64(printed)/elapsed)
+	}
+
+	fmt.Fprintf(out, "║ Bandwidth:             %-10.2f MB/sec                            ║\n", float64(read*16)/elapsed/1024/1024)
+	fmt.Fprintln(out, "╠══════════════════════════════════════════════════════════════════════╣")
+	fmt.Fprintf(out, "║ Memory Allocated:      %-10.2f MB                               ║\n", float64(mem.Alloc)/1024/1024)
+	fmt.Fprintf(out, "║ Total Allocated:       %-10.2f MB                               ║\n", float64(mem.TotalAlloc)/1024/1024)
+	fmt.Fprintf(out, "║ Num GC Runs:           %-10d                                     ║\n", mem.NumGC)
+	fmt.Fprintln(out, "╚══════════════════════════════════════════════════════════════════════╝")
+}
+
+// ============================================================================
+// SYMBOL RESOLUTION
+// ============================================================================
+
 type Symbol struct {
 	Addr uint64
 	Name string
 }
 
-var symbolList []Symbol // A sorted slice instead of a map
+var symbolList []Symbol
 
 func loadSymbols() {
 	file, err := os.Open("/proc/kallsyms")
@@ -174,37 +128,30 @@ func loadSymbols() {
 		return
 	}
 	defer file.Close()
-	// Format: ADDRESS TYPE NAME
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 3 {
-			continue //Skip malformed lines
+			continue
 		}
-		// Address is field 0, Name is field 2
 		addr, _ := strconv.ParseUint(fields[0], 16, 64)
-		// symbolCache[addr] = fields[2]
 		symbolList = append(symbolList, Symbol{Addr: addr, Name: fields[2]})
 	}
 
-	// Sort by address so we can use binary search
 	sort.Slice(symbolList, func(i, j int) bool {
 		return symbolList[i].Addr < symbolList[j].Addr
 	})
 }
 
 func findNearestSymbol(addr uint64) string {
-	// Find the first element greater than addr
 	idx := sort.Search(len(symbolList), func(i int) bool {
 		return symbolList[i].Addr > addr
 	})
 
-	// The nearest symbol is the one right before that
 	if idx > 0 {
 		match := symbolList[idx-1]
 		offset := addr - match.Addr
-		// Only return if it's reasonably close (e.g., within 0x10000 bytes)
-		// This prevents matching totally unrelated symbols
 		if offset < 0x10000 {
 			return fmt.Sprintf("%s+0x%x", match.Name, offset)
 		}
@@ -212,63 +159,43 @@ func findNearestSymbol(addr uint64) string {
 	return fmt.Sprintf("0x%x", addr)
 }
 
-type Config struct {
-	// Output control
-	EnablePrinting bool
-	PrintInterval  time.Duration
-
-	// Benchmark mode
-	BenchmarkMode     bool
-	BenchmarkDuration time.Duration
-
-	// Sampling
-	SampleRate uint32 // Print 1 in N events
-}
-
-func DefaultConfig() *Config {
-	return &Config{
-		EnablePrinting:    true,
-		PrintInterval:     0, // 0 = print everything
-		BenchmarkMode:     false,
-		BenchmarkDuration: 30 * time.Second,
-		SampleRate:        1, // No sampling
-	}
-}
+// ============================================================================
+// MAIN
+// ============================================================================
 
 func main() {
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <mode> <duration_seconds>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nModes:\n")
+		fmt.Fprintf(os.Stderr, "  print      - Print every event (measures I/O bottleneck)\n")
+		fmt.Fprintf(os.Stderr, "  benchmark  - Count only, no printing (measures max throughput)\n")
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s print 30           # Print mode for 30 seconds\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s benchmark 30       # Benchmark mode for 30 seconds\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s print 30 > out.txt # Redirect prints to file\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	mode := os.Args[1]
+	duration, err := strconv.Atoi(os.Args[2])
+	if err != nil {
+		log.Fatalf("Invalid duration: %v", err)
+	}
+
+	printMode := false
+	switch mode {
+	case "print":
+		printMode = true
+	case "benchmark":
+		printMode = false
+	default:
+		log.Fatalf("Invalid mode: %s (use 'print' or 'benchmark')", mode)
+	}
 
 	loadSymbols()
+	metrics := NewMetrics()
 
-	config := DefaultConfig()
-	if len(os.Args) > 1 {
-		if os.Args[1] == "benchmark" {
-			config.BenchmarkMode = true
-			config.EnablePrinting = false
-			fmt.Println("Benchmark Mode:")
-			fmt.Println("Printing disabled for maximum throughput")
-		}
-		if len(os.Args) > 2 {
-			duration, err := strconv.Atoi(os.Args[2])
-			if err == nil {
-				config.BenchmarkDuration = time.Duration(duration) * time.Second
-			}
-		}
-	} else if os.Args[1] == "sample" {
-		if len(os.Args) > 2 {
-			rate, err := strconv.Atoi(os.Args[2])
-			if err == nil {
-				config.SampleRate = uint32(rate)
-				fmt.Printf("SAMPLING MODE: Printing 1 in %d events\n", rate)
-			}
-		}
-	}
-	metrics := NewBenchmarkMetrics()
-
-	// Counters for throughput calculation
-	// var count uint64     //Total events processed
-	// var lastCount uint64 //Events at last metric print
-
-	var dropReasons = map[uint32]string{
+	dropReasons := map[uint32]string{
 		2:  "NOT_SPECIFIED",
 		3:  "NO_SOCKET",
 		5:  "TCP_CSUM",
@@ -276,104 +203,87 @@ func main() {
 		21: "TCP_LISTEN_OVERFLOW",
 		64: "TCP_RETRANSMIT",
 	}
-	//1. Allow the program to lock memory for eBPF resources
-	//RemoveMemlock() removes restrictions on how much memory current process can lock into RAM
-	//Why eBPF programs need this?
-	//Linux kernel cannot afford the "slowdown" of waiting for an SSD
+
+	// eBPF setup
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
-	//2. Load compiled objects into the kernel, create ring buffer map
+
 	objs := monitorObjects{}
 	if err := loadMonitorObjects(&objs, nil); err != nil {
 		log.Fatalf("loading objects: %v", err)
 	}
 	defer objs.Close()
-	//objs isn't a normal Go struct, it holds File Descriptors of the kernel
-	//Prevent Resource Leak.
 
-	//3. Attach to the tcp_drop hook (tracepoint)
-	//A link represents the conenction between a program and a hook
 	tp, err := link.Tracepoint("skb", "kfree_skb", objs.TraceTcpDrop, nil)
 	if err != nil {
 		log.Fatalf("opening tracepoint: %v", err)
 	}
 	defer tp.Close()
-	//Puts the NOP back in for the tracepoint
 
-	//4. Open the ring buffer to read data from kernel
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("opening ringbuf reader: %v", err)
 	}
 	defer rd.Close()
-	fmt.Println("Monitor Active: Watching for TCP packet drops...")
 
-	//Signal handling
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Print startup message to stderr
+	if printMode {
+		fmt.Fprintf(os.Stderr, "🖨️  PRINT MODE: Every event will be printed\n")
+		fmt.Fprintf(os.Stderr, "   Duration: %d seconds\n", duration)
+		fmt.Fprintf(os.Stderr, "   Events will print to stdout\n")
+		fmt.Fprintf(os.Stderr, "   Metrics will print to stderr\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "🔬 BENCHMARK MODE: No printing (maximum throughput)\n")
+		fmt.Fprintf(os.Stderr, "   Duration: %d seconds\n", duration)
+	}
+	fmt.Fprintf(os.Stderr, "\n   Starting in 3 seconds...\n\n")
+	time.Sleep(3 * time.Second)
 
-	//5. Handle graceful shutdown
-	//log.Fatal() would stop the program without closing anything
+	// Signal handling
 	stopper := make(chan os.Signal, 1)
-	//We create a channel to listen for signals with buffer 1
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-	//On recieving Exit, OS pokes the channel instead of immediately killing the program
-	//os.Interrupt = SIGINT -= Ctrl+C
-	//syscall.SIGTERM - by system tools like Docker, kill <pid> on another terminal
 
-	if config.BenchmarkMode {
-		go func() {
-			time.Sleep(config.BenchmarkDuration)
-			stopper <- syscall.SIGTERM
-		}()
+	// Auto-stop timer
+	go func() {
+		time.Sleep(time.Duration(duration) * time.Second)
+		stopper <- syscall.SIGTERM
+	}()
+
+	// Streaming metrics (to stderr, won't interfere with stdout)
+	if !printMode {
+		go metrics.StreamingReport(printMode)
 	}
 
-	//Event processing goroutine
+	// Event reader
+	done := make(chan struct{})
 	go func() {
-		var eventNum uint64
+		defer close(done)
 		for {
 			select {
-			case <-ctx.Done():
+			case <-stopper:
 				return
 			default:
 			}
-			readStart := time.Now()
-			record, err := rd.Read()
-			readDuration := time.Since(readStart)
 
+			record, err := rd.Read()
 			if err != nil {
 				if errors.Is(err, ringbuf.ErrClosed) {
 					return
 				}
-				metrics.RingbufErrors.Add(1)
-				// atomic.AddUint64(&count, 1) // High-performance thread-safe counter
-				// log.Printf("error reading from ringbuf: %v", err)
 				continue
 			}
-			// var event monitorEvent //struct we defined in C!
-			// if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, event); err != nil {
-			// 	log.Printf("parsing event: %v", err)
-			// 	continue
-			// }
+
 			if len(record.RawSample) < int(unsafe.Sizeof(monitorEvent{})) {
 				metrics.EventsDropped.Add(1)
-				// log.Printf("sample too small: %d", len(record.RawSample))
 				continue
 			}
-			//Safety check
-			//RawSample is raw, unparsed data that eBPF sent from the kernel
-			//RHS is our struct that we are fitting it into
-			//If data recieved is too smol we skip
 
 			event := *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))
-			eventNum++
+			metrics.EventsRead.Add(1)
 
-			metrics.RecordEvent(len(record.RawSample))
-			metrics.RecordLatency(uint64(readDuration.Microseconds()))
-
-			// Conditional printing
-			if config.EnablePrinting && (eventNum%uint64(config.SampleRate) == 0) {
+			if printMode {
+				// PRINT TO STDOUT (this is what we're measuring!)
 				reasonStr := dropReasons[event.Reason]
 				if reasonStr == "" {
 					reasonStr = fmt.Sprintf("UNKNOWN(%d)", event.Reason)
@@ -384,32 +294,27 @@ func main() {
 					symbolName = fmt.Sprintf("0x%x", event.Location)
 				}
 
-				fmt.Printf("[%s] Drop | PID: %-6d | Reason: %-18s| Function: %s\n",
+				// Print to STDOUT
+				fmt.Printf("[%s] Drop | PID: %-6d | Reason: %-18s | Function: %s\n",
 					time.Now().Format("15:04:05"),
 					event.Pid,
 					reasonStr,
 					symbolName)
+
+				metrics.EventsPrinted.Add(1)
 			}
+			// In benchmark mode, we just count and continue (no printing)
 		}
 	}()
 
-	//Metrics goroutine
-	go func() {
-		if config.BenchmarkMode {
-			metrics.StreamingReport()
-		} else {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				eventsRead := metrics.EventsRead.Load()
-				fmt.Printf("\n--- Total Events: %d ---\n\n", eventsRead)
-			}
-		}
-	}()
-
+	// Wait for stop
 	<-stopper
-	cancel() //Stop all goroutines
-	fmt.Println("\nShutting down...")
-	time.Sleep(100 * time.Millisecond) //Give goroutines time to finish
-	metrics.Report()
+
+	// Give reader goroutine time to finish
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	metrics.FinalReport(printMode)
 }
