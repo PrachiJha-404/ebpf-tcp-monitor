@@ -9,6 +9,7 @@ __debug_bin
 *_bpfeb.go
 *_bpfel.o
 *_bpfeb.o
+*.o
 
 # Kernel headers
 # vmlinux.h is specific to YOUR kernel version. 
