@@ -208,6 +208,33 @@ func (p *EventProcessor) ProcessEvent(event *monitorEvent, doPrint bool) {
 	p.metrics.BytesWritten.Add(uint64(n))
 }
 
+// ProcessEventBusy does all the work of file mode but discards output
+func (p *EventProcessor) ProcessEventBusy(event *monitorEvent) {
+	p.metrics.EventsRead.Add(1)
+
+	// Do ALL the same expensive work as file mode
+	reasonStr := p.dropReasons[event.Reason]
+	if reasonStr == "" {
+		reasonStr = fmt.Sprintf("UNKNOWN(%d)", event.Reason)
+	}
+
+	// This is the expensive part (binary search through kernel symbols)
+	symbolName := findNearestSymbol(event.Location)
+	if symbolName == "" {
+		symbolName = fmt.Sprintf("0x%x", event.Location)
+	}
+
+	// Format the string (allocates memory, same as file mode)
+	_ = fmt.Sprintf("[%s] Drop | PID: %-6d | Reason: %-18s | Function: %s\n",
+		time.Now().Format("15:04:05"),
+		event.Pid,
+		reasonStr,
+		symbolName)
+
+	// But DON'T write it (testing if the work itself helps)
+	p.metrics.EventsPrinted.Add(1)
+}
+
 func (p *EventProcessor) Flush() {
 	p.buffered.Flush()
 }
@@ -242,6 +269,12 @@ func getModes() map[string]BenchmarkMode {
 			DoPrint:     false,
 			Output:      io.Discard,
 			Description: "No printing, pure counting (tests max throughput)",
+		},
+		"busy": {
+			Name:        "BUSY MODE",
+			DoPrint:     false,
+			Output:      io.Discard,
+			Description: "Do all work except print (tests if work helps throughput)",
 		},
 	}
 }
@@ -370,7 +403,12 @@ func main() {
 			}
 
 			event := *(*monitorEvent)(unsafe.Pointer(&record.RawSample[0]))
-			processor.ProcessEvent(&event, mode.DoPrint)
+
+			if modeKey == "busy" {
+				processor.ProcessEventBusy(&event)
+			} else {
+				processor.ProcessEvent(&event, mode.DoPrint)
+			}
 		}
 	}()
 

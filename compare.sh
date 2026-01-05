@@ -52,10 +52,14 @@ echo -e "${YELLOW}TEST 1: Terminal Mode (slowest, limited by TTY)${NC}"
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
 TERMINAL_LOG="$OUTPUT_DIR/terminal_${TIMESTAMP}.log"
-$BINARY terminal $DURATION > "$TERMINAL_LOG" 2>&1
 
-echo -e "${GREEN}✓ Terminal test complete${NC}"
-echo -e "  Output saved to: $TERMINAL_LOG\n"
+# Run in background, capture both stdout and stderr to log
+# but let it print to actual terminal (no redirection = real TTY speed)
+echo -e "${YELLOW}Note: Terminal output will scroll rapidly. Capturing metrics...${NC}\n"
+$BINARY terminal $DURATION 2> >(tee -a "$TERMINAL_LOG" >&2)
+
+echo -e "\n${GREEN}✓ Terminal test complete${NC}"
+echo -e "  Metrics saved to: $TERMINAL_LOG\n"
 sleep 2
 
 # ============================================================================

@@ -1,5 +1,13 @@
 //Gotta put this in gitignore
 
+### WHat is eBPF
+
+- eBPF lets you run sandboxed programs inside the Linux kernel without changing kernel code or loading kernel modules. It's like having a "safe API" into the kernel.
+
+### What's a Ring Buffer?
+
+- A circular buffer in kernel memory that eBPF programs write to. Userspace programs read from it. It's the communication channel between kernel and your Go program.
+
 ### Why does ebpf need us to lock the RAM?
 
 - In Linux kernel, certain paths are critical paths that the kernel treats as high priority.
@@ -111,6 +119,30 @@ Command: ```bash sudo cat /sys/kernel/debug/tracing/events/skb/kfree_skb/format 
 - `(*monitorEvent)(...)` - Type reinterpretation. Tells the compiler: "Treat this address as the start of a monitorEvent struct.
 - `*` - Derefernce. Copies data from the memory address to a Go variable.
 
+### What is Kernel Symbol Table?
+
+- It is a data structure that maps memory addresses (where the code lives) to human-readable names (the functions and variables developers wrote).
+- It's exposed in a virtual file - /proc/kallsyms
+- It contains a list of every function and global variable currently loaded in the kernel, including those from drivers and modules.
+- The file /proc/kallsyms doesn't actually exist on the hard drive. It is generated on the fly by the kernel when you open it. This is because:
+
+    1. Dynamic Modules: When you plug in a USB device or load a driver, new symbols are added to the table.
+
+    2. KASLR: Because the kernel moves its location in memory every time you reboot (for security), the addresses in the table change constantly.
+- When our eBPF program catches a drop, it sees the instruction pointer (IP). Which points to where the error happened. Our code finds the address in the table that is closest to, but not greater than, the IP we caught and reports the function name.
+
+### Why do we use slice instead of map for function name lookup?
+
+- Map (Hash table) is great for instant lookup, but it's binary. It has no conecpt of neighboring values. 
+- With a sorted slice, we can perform a binary search which let's us find the greatest lower bound.
+
 ### IDEAS
 - Instead of collecting each snapshot for each dropped packet in the buffer, I can group them together into a hash map grouped by PID, reason, COUNT
 - Initially, the functions couldn't be identified.
+
+### How I plan to continue:
+
+- Understand the main.go code in 3modes/busy-mode just to catch errors
+- HOW is file mode more optimized, why we tried busy mode, all in claude 15289 mail
+- Make aggregator in file mode
+- Article
