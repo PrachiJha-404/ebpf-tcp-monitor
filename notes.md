@@ -136,6 +136,30 @@ Command: ```bash sudo cat /sys/kernel/debug/tracing/events/skb/kfree_skb/format 
 - Map (Hash table) is great for instant lookup, but it's binary. It has no conecpt of neighboring values. 
 - With a sorted slice, we can perform a binary search which let's us find the greatest lower bound.
 
+### Why do we need Symbols Cache?
+- Accessing /proc/kallsyms isn't like reading a normal file from a SSD, it is a "virtual file" generated on-the-fly by the kernel.
+- Doing that setup once at the start of the program (in loadSymbols) is a one-time "tax".
+
+### How is monitorObjects doing everything??
+- The monitorObjects and bpf2go Workflow The monitorObjects struct serves as a dual-purpose bridge between Go and the Linux kernel. It starts as a "shipping container" that embeds compiled eBPF bytecode directly into the Go binary as a hidden variable, making the executable self-contained. When loadMonitorObjects is called, this bytecode is injected into the kernel, verified for safety, and JIT-compiled for native performance. Once loaded, the struct transitions into a "control panel," storing File Descriptors (numeric IDs) that represent the live BPF programs and maps (like the Events ring buffer). This allows the Go program to interact with kernel-space data using standard Go dot notation, while the defer objs.Close() ensures these resources are cleanly removed from the kernel memory upon exit.
+
+### What does ticker do?
+- Creates a clock that ticks every 1 second and pokes through the channel ticker.C (usage: for range ticker.C{})
+
+### Why do we use MemStats?
+-MemStats lets us know- 
+how much memory your program is allocating
+how often the garbage collector runs
+whether allocations are increasing over time
+whether GC pressure correlates with throughput drops
+- It has Alloc and TotalAlloc, Alloc is memory currently in use (goes down with GC) and TotalAlloc is all the memory the pgm has ever allocated.
+
+### Where heaps?
+-fmt.Sprintf() is using heaps since it has a return value so it makes sense to check the GC pressure.
+
+### Why do we remove MemLock in main?
+- We remove (raise) the memlock limit so the kernel allows our eBPF program to allocate the memory it needs (maps, ring buffers, programs).
+
 ### IDEAS
 - Instead of collecting each snapshot for each dropped packet in the buffer, I can group them together into a hash map grouped by PID, reason, COUNT
 - Initially, the functions couldn't be identified.
@@ -146,3 +170,5 @@ Command: ```bash sudo cat /sys/kernel/debug/tracing/events/skb/kfree_skb/format 
 - HOW is file mode more optimized, why we tried busy mode, all in claude 15289 mail
 - Make aggregator in file mode
 - Article
+
+https://excalidraw.com/#json=qSZhdl0OZ267a1TECQdhx,sgzj5j78-tz2wO68yTEdCw

@@ -1,34 +1,32 @@
 package main
 
 import (
-	"bufio"
+	"bufio" //Allows code to store large chunks of data in RAM
 	"errors"
 	"fmt"
-	"io"
+	"io" // Basic interfaces for i/o primitives
 	"log"
-	"os"
-	"os/signal"
-	"runtime"
+	"os"        // Platform independent interface for calling os functionalities
+	"os/signal" // Listen for Ctrl+C
+	"runtime"   // Used here for MemStats
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync/atomic" // Uses locks for atomic updates to counters
 	"syscall"
 	"time"
-	"unsafe"
+	"unsafe" // unsafe type casting of raw byte slice to monitorEvent struct
 
-	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/link" // Handles attaching compiled EBPF program to hook
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/cilium/ebpf/rlimit"
+	"github.com/cilium/ebpf/rlimit" // To remove the memory lock limit
 )
 
-// ============================================================================
-// METRICS TRACKING
-// ============================================================================
+// Metrics Tracking
 
 type Metrics struct {
 	StartTime     time.Time
-	EventsRead    atomic.Uint64
+	EventsRead    atomic.Uint64 // to prevent race
 	EventsPrinted atomic.Uint64
 	BytesWritten  atomic.Uint64
 }
@@ -54,7 +52,7 @@ func (m *Metrics) Report() {
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 
-		// Always print to stderr so it doesn't interfere with stdout redirection
+		// Print to stderr so it doesn't interfere with stdout redirection
 		fmt.Fprintf(os.Stderr, "[%s] Rate: %8.0f ev/s | Total: %10d | Mem: %5.1f MB\n",
 			now.Format("15:04:05"),
 			eps,
@@ -99,11 +97,10 @@ func (m *Metrics) FinalReport(modeName string) {
 	fmt.Fprintf(os.Stderr, "║ Total Allocated:    %8.2f MB                                       ║\n", float64(mem.TotalAlloc)/1024/1024)
 	fmt.Fprintf(os.Stderr, "║ GC Runs:            %8d                                            ║\n", mem.NumGC)
 	fmt.Fprintln(os.Stderr, "╚══════════════════════════════════════════════════════════════════════╝")
+	//GC Runs: Garbage Collection Runs : Important metrics - direct indicator of memory pressure
 }
 
-// ============================================================================
-// SYMBOL RESOLUTION
-// ============================================================================
+// Symbol Resolution
 
 type Symbol struct {
 	Addr uint64
@@ -120,10 +117,10 @@ func loadSymbols() {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(file) // Reads file line by line
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
-		if len(fields) < 3 {
+		if len(fields) < 3 { // Address, Type, Name
 			continue
 		}
 		addr, _ := strconv.ParseUint(fields[0], 16, 64)
@@ -134,7 +131,7 @@ func loadSymbols() {
 		return symbolList[i].Addr < symbolList[j].Addr
 	})
 
-	fmt.Fprintf(os.Stderr, "✓ Loaded %d kernel symbols\n", len(symbolList))
+	fmt.Fprintf(os.Stderr, "Loaded %d kernel symbols\n", len(symbolList))
 }
 
 func findNearestSymbol(addr uint64) string {
@@ -152,9 +149,7 @@ func findNearestSymbol(addr uint64) string {
 	return fmt.Sprintf("0x%x", addr)
 }
 
-// ============================================================================
-// EVENT PROCESSING
-// ============================================================================
+// Event Processing
 
 type EventProcessor struct {
 	writer      io.Writer
@@ -209,6 +204,7 @@ func (p *EventProcessor) ProcessEvent(event *monitorEvent, doPrint bool) {
 }
 
 // ProcessEventBusy does all the work of file mode but discards output
+// To isolate Work cost and I/O cost
 func (p *EventProcessor) ProcessEventBusy(event *monitorEvent) {
 	p.metrics.EventsRead.Add(1)
 
@@ -239,9 +235,7 @@ func (p *EventProcessor) Flush() {
 	p.buffered.Flush()
 }
 
-// ============================================================================
 // BENCHMARK MODES
-// ============================================================================
 
 type BenchmarkMode struct {
 	Name        string
@@ -279,9 +273,7 @@ func getModes() map[string]BenchmarkMode {
 	}
 }
 
-// ============================================================================
 // MAIN
-// ============================================================================
 
 func main() {
 	if len(os.Args) < 3 {
@@ -333,51 +325,62 @@ func main() {
 	fmt.Fprintf(os.Stderr, "╚══════════════════════════════════════════════════════════════════════╝\n\n")
 
 	loadSymbols()
+	// 1. Load all symbols
+
 	metrics := NewMetrics()
+	// 2. Initialize metrics
 
 	// eBPF setup
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
+	// 3. Remove memory lock limit
 
 	objs := monitorObjects{}
 	if err := loadMonitorObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading eBPF objects: %v", err)
 	}
 	defer objs.Close()
+	// 4. Load bytecode embedding variable (monitorObjects) into kernel
 
 	tp, err := link.Tracepoint("skb", "kfree_skb", objs.TraceTcpDrop, nil)
 	if err != nil {
 		log.Fatalf("Attaching tracepoint: %v", err)
 	}
 	defer tp.Close()
+	// 5. Attach to hook
 
-	rd, err := ringbuf.NewReader(objs.Events)
+	rd, err := ringbuf.NewReader(objs.Events) //objs.Events is FD to C's events description
 	if err != nil {
 		log.Fatalf("Opening ringbuf: %v", err)
 	}
 	defer rd.Close()
+	// 6. Create BPF ringbuf reader
 
 	processor := NewEventProcessor(mode.Output, metrics)
+	// 7. New processor
 
-	fmt.Fprintf(os.Stderr, "✓ eBPF program loaded and attached\n")
-	fmt.Fprintf(os.Stderr, "✓ Starting in 3 seconds...\n\n")
+	fmt.Fprintf(os.Stderr, "eBPF program loaded and attached\n")
+	fmt.Fprintf(os.Stderr, "Starting in 3 seconds...\n\n")
 	time.Sleep(3 * time.Second)
 
 	// Signal handling
-	stopper := make(chan os.Signal, 1)
+	stopper := make(chan os.Signal, 1) // Buffered channel that can hold 1 signal at a time
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
+	// 8. Signal handling channel
 
 	// Auto-stop timer
 	go func() {
 		time.Sleep(time.Duration(duration) * time.Second)
 		stopper <- syscall.SIGTERM
-	}()
+	}() //erload effects introduce
+	// 9. Timer
 
 	// Metrics reporter (only in benchmark mode to avoid cluttering terminal)
 	if modeKey == "benchmark" {
 		go metrics.Report()
 	}
+	// 10. Running report for benchmark mode
 
 	// Event reader
 	done := make(chan struct{})

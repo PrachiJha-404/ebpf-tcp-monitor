@@ -14,7 +14,7 @@ generate:
 # Build the Go binary
 build: generate
 	@echo "Building $(BINARY)..."
-	go build -o $(BINARY)
+	go build -buildvcs=false -o $(BINARY)
 	@echo "✓ Build complete: ./$(BINARY)"
 
 # Clean build artifacts
