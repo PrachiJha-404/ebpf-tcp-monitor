@@ -163,4 +163,4 @@ None confirmed yet. If you have ideas, open an issue or ping me.
 
 ## Presented At
 
-Bengaluru Systems Meetup — February 2026
+Bengaluru Systems Meetup — January 2026
