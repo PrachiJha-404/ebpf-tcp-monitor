@@ -9,6 +9,7 @@ import (
 	"os"        // Platform independent interface for calling os functionalities
 	"os/signal" // Listen for Ctrl+C
 	"runtime"   // Used here for MemStats
+	"runtime/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,10 +45,10 @@ func (m *Metrics) Report() {
 
 	for range ticker.C {
 		now := time.Now()
-		current := m.EventsRead.Load()
+		current := m.EventsRead.Load() //To read atomic data types we always gotta use .Load()
 
 		elapsed := now.Sub(lastTime).Seconds()
-		eps := float64(current-lastCount) / elapsed
+		eps := float64(current-lastCount) / elapsed //Gets caluclated every second
 
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
@@ -138,6 +139,7 @@ func findNearestSymbol(addr uint64) string {
 	idx := sort.Search(len(symbolList), func(i int) bool {
 		return symbolList[i].Addr > addr
 	})
+	//We cannot do return symbolList[i].Addr < addr because it'll return the first true value. It loosk for False->True. Not True->False.
 
 	if idx > 0 {
 		match := symbolList[idx-1]
@@ -173,6 +175,8 @@ func NewEventProcessor(output io.Writer, metrics *Metrics) *EventProcessor {
 		},
 	}
 }
+
+//This function might seem redundant but it's needed to guarantee that EventProcessor is always correctly initialized.
 
 func (p *EventProcessor) ProcessEvent(event *monitorEvent, doPrint bool) {
 	p.metrics.EventsRead.Add(1)
@@ -255,7 +259,7 @@ func getModes() map[string]BenchmarkMode {
 		"file": {
 			Name:        "FILE MODE",
 			DoPrint:     true,
-			Output:      nil, // Set dynamically
+			Output:      nil, //User sets it
 			Description: "Print to file via stdout redirect (tests buffered I/O)",
 		},
 		"benchmark": {
@@ -276,6 +280,7 @@ func getModes() map[string]BenchmarkMode {
 // MAIN
 
 func main() {
+	fmt.Fprintf(os.Stderr, "!!! CODE VERSION CHECK: 2024-02-07-v2 !!!\n\n")
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <mode> <duration_seconds>\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Modes:\n")
@@ -306,9 +311,32 @@ func main() {
 		log.Fatalf("Invalid mode '%s'. Use: terminal, file, or benchmark", modeKey)
 	}
 
+	// START PROFILING IMMEDIATELY AFTER MODE VALIDATION
+	fmt.Fprintf(os.Stderr, "DEBUG: Mode is '%s'\n", modeKey)
+
+	var cpuProfile *os.File
+	if modeKey == "benchmark" || modeKey == "busy" || modeKey == "file" {
+		fmt.Fprintf(os.Stderr, "DEBUG: Starting profiling setup...\n")
+
+		profPath := fmt.Sprintf("./cpu_%s.prof", modeKey)
+		fmt.Fprintf(os.Stderr, "DEBUG: Profile path: %s\n", profPath)
+
+		cpuProfile, err = os.Create(profPath)
+		if err != nil {
+			log.Fatalf("ERROR creating profile: %v", err)
+		}
+
+		fmt.Fprintf(os.Stderr, "DEBUG: File created\n")
+
+		if err := pprof.StartCPUProfile(cpuProfile); err != nil {
+			log.Fatalf("ERROR starting profile: %v", err)
+		}
+
+		fmt.Fprintf(os.Stderr, "✓ Profiling to: %s\n\n", profPath)
+	}
+
 	// Special handling for file mode
 	if modeKey == "file" {
-		// Check if stdout is redirected
 		stat, _ := os.Stdout.Stat()
 		if (stat.Mode() & os.ModeCharDevice) != 0 {
 			log.Fatalf("FILE mode requires stdout redirection. Use: %s file 30 > output.txt", os.Args[0])
@@ -325,62 +353,51 @@ func main() {
 	fmt.Fprintf(os.Stderr, "╚══════════════════════════════════════════════════════════════════════╝\n\n")
 
 	loadSymbols()
-	// 1. Load all symbols
-
 	metrics := NewMetrics()
-	// 2. Initialize metrics
 
 	// eBPF setup
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
-	// 3. Remove memory lock limit
 
 	objs := monitorObjects{}
 	if err := loadMonitorObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading eBPF objects: %v", err)
 	}
 	defer objs.Close()
-	// 4. Load bytecode embedding variable (monitorObjects) into kernel
 
 	tp, err := link.Tracepoint("skb", "kfree_skb", objs.TraceTcpDrop, nil)
 	if err != nil {
 		log.Fatalf("Attaching tracepoint: %v", err)
 	}
 	defer tp.Close()
-	// 5. Attach to hook
 
-	rd, err := ringbuf.NewReader(objs.Events) //objs.Events is FD to C's events description
+	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
 		log.Fatalf("Opening ringbuf: %v", err)
 	}
 	defer rd.Close()
-	// 6. Create BPF ringbuf reader
 
 	processor := NewEventProcessor(mode.Output, metrics)
-	// 7. New processor
 
-	fmt.Fprintf(os.Stderr, "eBPF program loaded and attached\n")
-	fmt.Fprintf(os.Stderr, "Starting in 3 seconds...\n\n")
+	fmt.Fprintf(os.Stderr, "✓ eBPF program loaded and attached\n")
+	fmt.Fprintf(os.Stderr, "✓ Starting in 3 seconds...\n\n")
 	time.Sleep(3 * time.Second)
 
 	// Signal handling
-	stopper := make(chan os.Signal, 1) // Buffered channel that can hold 1 signal at a time
+	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-	// 8. Signal handling channel
 
 	// Auto-stop timer
 	go func() {
 		time.Sleep(time.Duration(duration) * time.Second)
 		stopper <- syscall.SIGTERM
-	}() //erload effects introduce
-	// 9. Timer
+	}()
 
-	// Metrics reporter (only in benchmark mode to avoid cluttering terminal)
+	// Metrics reporter
 	if modeKey == "benchmark" {
 		go metrics.Report()
 	}
-	// 10. Running report for benchmark mode
 
 	// Event reader
 	done := make(chan struct{})
@@ -418,10 +435,15 @@ func main() {
 	// Wait for stop signal
 	<-stopper
 
-	// Flush any remaining buffered output
+	// Stop profiling BEFORE final report
+	if cpuProfile != nil {
+		pprof.StopCPUProfile()
+		cpuProfile.Close()
+		fmt.Fprintf(os.Stderr, "\n✓ Profile saved\n")
+	}
+
 	processor.Flush()
 
-	// Give reader goroutine time to finish
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
